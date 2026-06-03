@@ -138,6 +138,49 @@ su -s /bin/bash qualys -c "source /app/qualys/.env && python3 /app/qualys/src/qu
 - Blob container is private — no anonymous access
 - HTTPS enforced on all API and storage connections
 
+## Planned improvements
+
+### Azure Key Vault migration
+Currently, Qualys API credentials are stored in `.env` on the container filesystem
+(chmod 600, owned by the `qualys` service user). While access is restricted, credentials
+are plain text at rest.
+
+The planned improvement is to migrate to Azure Key Vault:
+
+- `qualys-username` and `qualys-password` moved to Key Vault secrets
+- Scripts fetch credentials at runtime via the existing Service Principal
+- `.env` reduced to non-sensitive bootstrapping values only (tenant ID, client ID, client secret)
+- Audit log of every secret access via Azure Monitor
+
+#### Full implementation — Azure Arc + Managed Identity
+The complete solution eliminates all credentials from disk using Azure Arc:
+
+1. Register the Proxmox LXC with Azure Arc (Settings → Servers → Add → Generated
+   onboarding script runs on the container)
+2. Azure assigns the container a Managed Identity automatically
+3. Assign Key Vault Secrets User role to the Managed Identity instead of the Service Principal
+4. Scripts authenticate using `ManagedIdentityCredential()` instead of `ClientSecretCredential()`
+5. `.env` file removed entirely — no credentials on disk at all
+
+```python
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+
+def get_secret(name):
+    credential = ManagedIdentityCredential()
+    client = SecretClient(vault_url=VAULT_URL, credential=credential)
+    return client.get_secret(name).value
+```
+
+This is the target architecture. The intermediate step (Key Vault with Service Principal)
+is a worthwhile improvement in the meantime and reuses the existing App Registration
+with no additional Azure infrastructure required.
+
+**Dependencies:** `azure-keyvault-secrets` (pip), Key Vault resource in Azure,
+Key Vault Secrets User role assigned to App Registration (interim) or Managed
+Identity (target). Azure Arc requires outbound HTTPS from the container to
+`*.his.arc.azure.com` and `*.guestconfiguration.azure.com`.
+
 ## Status
 
 | Component | Status |
