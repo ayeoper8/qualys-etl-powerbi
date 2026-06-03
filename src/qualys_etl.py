@@ -21,9 +21,9 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 
 BASE_URL   = "https://qualysapi.qg1.apps.qualys.co.uk"
-USERNAME   = os.getenv("username")
-PASSWORD   = os.getenv("password")
-OUTPUT_DIR = Path("./output")
+USERNAME = os.getenv("QUALYS_USERNAME")
+PASSWORD = os.getenv("QUALYS_PASSWORD")
+OUTPUT_DIR = Path("/app/qualys/output")
 TODAY      = datetime.date.today().isoformat()
 
 # Stale threshold — only flagged for Servers

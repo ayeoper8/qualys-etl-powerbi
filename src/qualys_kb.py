@@ -143,7 +143,7 @@ def main():
         all_records.extend(records)
         print(f"  [batch {i}/{len(batches)}] got {len(records)} records")
 
-    print(f"[+] Total KB records fetched: {len(records)}")
+    print(f"[+] Total KB records fetched: {len(all_records)}")
 
     # ── Write kb.csv (overwrite — it's a lookup table) ────────────────────────
     print(f"[+] Writing {KB_PATH}...")
