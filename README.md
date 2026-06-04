@@ -1,4 +1,4 @@
-# qualys-powerbi-pipeline
+# qualys-etl-powerbi
 
 Automated vulnerability reporting pipeline — pulls data from the Qualys API, transforms it into clean datasets, and feeds Power BI dashboards for management and security team reporting.
 
@@ -6,12 +6,13 @@ Automated vulnerability reporting pipeline — pulls data from the Qualys API, t
 
 A daily ETL pipeline running on a Proxmox LXC container that:
 
-1. Authenticates with the Qualys API
-2. Pulls VM detection data across the full asset estate
-3. Classifies assets into groups (Servers, Endpoints, Vessels, Network, Hypervisor)
-4. Writes clean CSV datasets with a 180-day rolling window
-5. Enriches vulnerability data with titles and CVSS scores from the Qualys KnowledgeBase
-6. Uploads to Azure Blob Storage for Power BI consumption
+1. Fetches Qualys API credentials from Azure Key Vault at runtime
+2. Authenticates with the Qualys API
+3. Pulls VM detection data across the full asset estate
+4. Classifies assets into groups (Servers, Endpoints, Vessels, Network, Hypervisor)
+5. Writes clean CSV datasets with a 180-day rolling window
+6. Enriches vulnerability data with titles and CVSS scores from the Qualys KnowledgeBase
+7. Uploads to Azure Blob Storage for Power BI consumption
 
 ## Architecture
 
@@ -19,6 +20,8 @@ A daily ETL pipeline running on a Proxmox LXC container that:
 [Proxmox LXC Container]
         ↓
 [qualys_etl.py — daily cron @ 06:00]
+        ↓
+[Azure Key Vault — credentials fetched at runtime]
         ↓
 [output/ — detections.csv, hosts.csv, summary.csv, kb.csv]
         ↓
@@ -70,7 +73,7 @@ Three Power BI pages:
 │   └── qualys_kb.py        # KnowledgeBase enrichment — run weekly
 ├── output/                 # Generated CSVs (not versioned)
 ├── logs/                   # ETL run logs (not versioned)
-├── .env                    # Credentials (not versioned)
+├── .env                    # Azure identity bootstrapping only (not versioned)
 └── run_etl.sh              # Cron wrapper
 ```
 
@@ -81,13 +84,16 @@ Three Power BI pages:
 - Python 3.x
 - Qualys subscription with API access
 - Azure Storage Account with a Blob container
-- Azure App Registration with Storage Blob Data Contributor role
+- Azure Key Vault with Qualys credentials stored as secrets
+- Azure App Registration with:
+  - Storage Blob Data Contributor role on the storage account
+  - Key Vault Secrets User role on the Key Vault
 
 ### Installation
 
 ```bash
 # Install dependencies
-pip3 install requests azure-storage-blob azure-identity --break-system-packages
+pip3 install requests azure-storage-blob azure-identity azure-keyvault-secrets --break-system-packages
 
 # Create directory structure
 mkdir -p /app/qualys/{src,output,logs}
@@ -99,16 +105,15 @@ chown -R qualys:qualys /app/qualys
 
 ### Configuration
 
-Create `/app/qualys/.env`:
+Create `/app/qualys/.env` — Azure identity bootstrapping only, no Qualys credentials:
 
 ```bash
-export QUALYS_USERNAME=your_username
-export QUALYS_PASSWORD='your_password'
 export AZURE_TENANT_ID=your_tenant_id
 export AZURE_CLIENT_ID=your_client_id
 export AZURE_CLIENT_SECRET='your_client_secret'
 export AZURE_STORAGE_ACCOUNT=your_storage_account_name
 export AZURE_CONTAINER_NAME=vulnerability-data
+export AZURE_KEYVAULT_URL=https://your-keyvault-name.vault.azure.net
 ```
 
 Lock down permissions:
@@ -116,6 +121,15 @@ Lock down permissions:
 chmod 600 /app/qualys/.env
 chown qualys:qualys /app/qualys/.env
 ```
+
+### Key Vault Secrets
+
+Create the following secrets in Azure Key Vault:
+
+| Secret name | Value |
+|---|---|
+| `qualys-api-username` | Qualys API username |
+| `qualys-api-password` | Qualys API password |
 
 ### Cron Schedule
 
@@ -132,64 +146,52 @@ su -s /bin/bash qualys -c "source /app/qualys/.env && python3 /app/qualys/src/qu
 
 ## Security Notes
 
-- `.env` is excluded from version control — never commit credentials
+- `.env` contains only Azure identity values — no Qualys credentials on disk
+- Qualys credentials stored in Azure Key Vault, fetched at runtime
 - Service runs as a dedicated non-login system user (`qualys`)
-- Azure auth uses Service Principal with minimum required permissions (Storage Blob Data Contributor)
+- `.env` is `chmod 600`, owned by `qualys` service user
+- Azure App Registration uses minimum required permissions (Storage Blob Data Contributor, Key Vault Secrets User)
 - Blob container is private — no anonymous access
 - HTTPS enforced on all API and storage connections
+- `.env` excluded from version control — never commit credentials
 
-## Planned improvements
+## Planned Improvements
 
-### Azure Key Vault migration
-Currently, Qualys API credentials are stored in `.env` on the container filesystem
-(chmod 600, owned by the `qualys` service user). While access is restricted, credentials
-are plain text at rest.
+### Azure Arc + Managed Identity
+The current setup uses a Service Principal (client secret in `.env`) for Azure authentication.
+The target architecture eliminates all credentials from disk using Azure Arc:
 
-The planned improvement is to migrate to Azure Key Vault:
-
-- `qualys-username` and `qualys-password` moved to Key Vault secrets
-- Scripts fetch credentials at runtime via the existing Service Principal
-- `.env` reduced to non-sensitive bootstrapping values only (tenant ID, client ID, client secret)
-- Audit log of every secret access via Azure Monitor
-
-#### Full implementation — Azure Arc + Managed Identity
-The complete solution eliminates all credentials from disk using Azure Arc:
-
-1. Register the Proxmox LXC with Azure Arc (Settings → Servers → Add → Generated
-   onboarding script runs on the container)
+1. Register the Proxmox LXC with Azure Arc
 2. Azure assigns the container a Managed Identity automatically
-3. Assign Key Vault Secrets User role to the Managed Identity instead of the Service Principal
-4. Scripts authenticate using `ManagedIdentityCredential()` instead of `ClientSecretCredential()`
-5. `.env` file removed entirely — no credentials on disk at all
+3. Assign Key Vault Secrets User and Storage Blob Data Contributor roles to the Managed Identity
+4. Scripts authenticate using `ManagedIdentityCredential()` — no credentials on disk at all
+5. `.env` file removed entirely
 
 ```python
 from azure.identity import ManagedIdentityCredential
-from azure.keyvault.secrets import SecretClient
-
-def get_secret(name):
-    credential = ManagedIdentityCredential()
-    client = SecretClient(vault_url=VAULT_URL, credential=credential)
-    return client.get_secret(name).value
+credential = ManagedIdentityCredential()
 ```
 
-This is the target architecture. The intermediate step (Key Vault with Service Principal)
-is a worthwhile improvement in the meantime and reuses the existing App Registration
-with no additional Azure infrastructure required.
-
-**Dependencies:** `azure-keyvault-secrets` (pip), Key Vault resource in Azure,
-Key Vault Secrets User role assigned to App Registration (interim) or Managed
-Identity (target). Azure Arc requires outbound HTTPS from the container to
+**Dependencies:** Azure Arc requires outbound HTTPS from the container to
 `*.his.arc.azure.com` and `*.guestconfiguration.azure.com`.
+
+### Other planned improvements
+- Teams webhook alerting on ETL failure
+- Retry logic on Qualys API calls
+- Weekly cron job for `qualys_kb.py` KnowledgeBase refresh
+- Daily log rotation
 
 ## Status
 
 | Component | Status |
 |---|---|
-| Qualys API connectivity | Complete |
-| ETL pipeline | Complete |
-| Asset classification | Complete |
-| KnowledgeBase enrichment | Complete |
-| QDS scoring | Complete |
-| Cron automation | Complete |
-| Azure Blob upload | In progress |
-| Power BI dashboards | In progress |
+| Qualys API connectivity | ✅ Complete |
+| ETL pipeline | ✅ Complete |
+| Asset classification | ✅ Complete |
+| KnowledgeBase enrichment | ✅ Complete |
+| QDS scoring | ✅ Complete |
+| Cron automation | ✅ Complete |
+| Azure Key Vault integration | ✅ Complete |
+| Azure Blob Storage upload | ✅ Complete |
+| Power BI dashboards | ⏳ In progress |
+| Power BI Service publishing | ⏳ In progress |
