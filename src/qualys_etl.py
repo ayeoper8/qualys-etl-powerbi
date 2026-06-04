@@ -1,5 +1,5 @@
 """
-Qualys ETL Script — v3
+Qualys ETL Script — v4
 Pulls VM detection data from Qualys API v4.0 and writes three CSVs:
   - detections.csv   (one row per detection per run — Active/New/Re-Opened + Fixed flagged)
   - hosts.csv        (one row per host per run)
@@ -8,6 +8,8 @@ Pulls VM detection data from Qualys API v4.0 and writes three CSVs:
 Each run APPENDS a snapshot_date row — do not overwrite.
 Duplicate protection: skips writing if today's snapshot already exists.
 On XML parse error: aborts the entire run to avoid partial snapshots.
+Credentials fetched from Azure Key Vault at runtime.
+CSVs uploaded to Azure Blob Storage after successful run.
 Run daily via cron to build trend data.
 """
 
@@ -22,8 +24,6 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 
 BASE_URL   = "https://qualysapi.qg1.apps.qualys.co.uk"
-USERNAME   = os.getenv("QUALYS_USERNAME")
-PASSWORD   = os.getenv("QUALYS_PASSWORD")
 OUTPUT_DIR = Path("/app/qualys/output")
 TODAY      = datetime.date.today().isoformat()
 
@@ -165,6 +165,72 @@ def logout(session):
         print(f"[!] Logout failed (non-fatal): {e}")
 
 
+def get_qualys_credentials():
+    """Fetch Qualys credentials from Azure Key Vault at runtime."""
+    from azure.identity import ClientSecretCredential
+    from azure.keyvault.secrets import SecretClient
+
+    tenant_id     = os.getenv("AZURE_TENANT_ID")
+    client_id     = os.getenv("AZURE_CLIENT_ID")
+    client_secret = os.getenv("AZURE_CLIENT_SECRET")
+    vault_url     = os.getenv("AZURE_KEYVAULT_URL")
+
+    if not all([tenant_id, client_id, client_secret, vault_url]):
+        print("[!] Azure credentials not set in .env — cannot fetch from Key Vault.")
+        return None, None
+
+    try:
+        credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        client = SecretClient(vault_url=vault_url, credential=credential)
+        username = client.get_secret("qualys-api-username").value
+        password = client.get_secret("qualys-api-password").value
+        print("[+] Credentials fetched from Key Vault.")
+        return username, password
+    except Exception as e:
+        print(f"[!] Failed to fetch credentials from Key Vault: {e}")
+        return None, None
+
+
+def upload_to_blob():
+    """Upload all four CSVs to Azure Blob Storage after ETL completes."""
+    from azure.identity import ClientSecretCredential
+    from azure.storage.blob import BlobServiceClient
+
+    tenant_id       = os.getenv("AZURE_TENANT_ID")
+    client_id       = os.getenv("AZURE_CLIENT_ID")
+    client_secret   = os.getenv("AZURE_CLIENT_SECRET")
+    storage_account = os.getenv("AZURE_STORAGE_ACCOUNT")
+    container_name  = os.getenv("AZURE_CONTAINER_NAME")
+
+    if not all([tenant_id, client_id, client_secret, storage_account, container_name]):
+        print("[!] Azure credentials incomplete — skipping upload. Check .env.")
+        return
+
+    try:
+        credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        blob_service = BlobServiceClient(
+            account_url=f"https://{storage_account}.blob.core.windows.net",
+            credential=credential
+        )
+        container = blob_service.get_container_client(container_name)
+
+        files = ["detections.csv", "hosts.csv", "summary.csv", "kb.csv"]
+        for filename in files:
+            path = OUTPUT_DIR / filename
+            if not path.exists():
+                print(f"  [!] {filename} not found — skipping")
+                continue
+            with open(path, "rb") as f:
+                container.upload_blob(filename, f, overwrite=True)
+            print(f"  uploaded {filename}")
+
+        print("[+] Azure Blob upload complete.")
+
+    except Exception as e:
+        print(f"[!] Azure upload failed (non-fatal): {e}")
+        print("    Local CSVs are intact — upload will retry on next run.")
+
+
 def fetch_all_hosts(session):
     """
     Pages through all hosts using the id_min cursor.
@@ -202,7 +268,6 @@ def fetch_all_hosts(session):
         try:
             root = ET.fromstring(clean_xml)
         except ET.ParseError as e:
-            # Save debug file then abort — don't write a partial snapshot
             debug_path = OUTPUT_DIR / f"debug_page_{page}.xml"
             with open(debug_path, "w", encoding="utf-8") as f:
                 f.write(resp.text)
@@ -233,10 +298,10 @@ def fetch_all_hosts(session):
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # ── Credential check ──────────────────────────────────────────────────────
+    # ── Fetch credentials from Key Vault ──────────────────────────────────────
+    USERNAME, PASSWORD = get_qualys_credentials()
     if not USERNAME or not PASSWORD:
-        print("[!] QUALYS_USERNAME or QUALYS_PASSWORD not set — check .env and ensure")
-        print("    'export' is used for each variable.")
+        print("[!] Could not retrieve credentials — aborting.")
         return
 
     # ── Duplicate run protection ───────────────────────────────────────────────
@@ -435,6 +500,10 @@ def main():
             if len(unclassified) > 10:
                 print(f"      ... and {len(unclassified) - 10} more")
 
+        # ── Upload to Azure Blob Storage ───────────────────────────────────────
+        print("[+] Uploading to Azure Blob Storage...")
+        upload_to_blob()
+
     except RuntimeError as e:
         print(f"\n[!] FATAL ERROR — run aborted: {e}")
         print("    No data has been written. Safe to re-run.")
@@ -447,3 +516,4 @@ if __name__ == "__main__":
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     main()
+
