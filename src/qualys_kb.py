@@ -11,6 +11,9 @@ not a time-series, so overwriting is correct behaviour.
 
 The KnowledgeBase API accepts up to 1000 QIDs per request.
 We batch in groups of 500 to stay well within limits.
+
+Credentials fetched from Azure Key Vault at runtime.
+kb.csv uploaded to Azure Blob Storage after successful run.
 """
 
 import requests
@@ -22,18 +25,89 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BASE_URL    = "https://qualysapi.qg1.apps.qualys.co.uk"
-USERNAME    = os.getenv("QUALYS_USERNAME")
-PASSWORD    = os.getenv("QUALYS_PASSWORD")
-OUTPUT_DIR  = Path("/app/qualys/output")
-KB_PATH     = OUTPUT_DIR / "kb.csv"
-DET_PATH    = OUTPUT_DIR / "detections.csv"
-BATCH_SIZE  = 500
+BASE_URL   = "https://qualysapi.qg1.apps.qualys.co.uk"
+OUTPUT_DIR = Path("/app/qualys/output")
+KB_PATH    = OUTPUT_DIR / "kb.csv"
+DET_PATH   = OUTPUT_DIR / "detections.csv"
+BATCH_SIZE = 500
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def strip_keepalives(xml_text):
+    """Qualys injects HTML comments mid-stream that break xml.etree parsing."""
     return re.sub(r'<!--.*?-->', '', xml_text, flags=re.DOTALL)
+
+
+def get_qualys_credentials():
+    """Fetch Qualys credentials from Azure Key Vault at runtime."""
+    from azure.identity import ClientSecretCredential
+    from azure.keyvault.secrets import SecretClient
+
+    tenant_id     = os.getenv("AZURE_TENANT_ID")
+    client_id     = os.getenv("AZURE_CLIENT_ID")
+    client_secret = os.getenv("AZURE_CLIENT_SECRET")
+    vault_url     = os.getenv("AZURE_KEYVAULT_URL")
+
+    if not all([tenant_id, client_id, client_secret, vault_url]):
+        print("[!] Azure credentials not set in .env — cannot fetch from Key Vault.")
+        return None, None
+
+    try:
+        credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        client = SecretClient(vault_url=vault_url, credential=credential)
+        username = client.get_secret("qualys-api-username").value
+        password = client.get_secret("qualys-api-password").value
+        print("[+] Credentials fetched from Key Vault.")
+        return username, password
+    except Exception as e:
+        print(f"[!] Failed to fetch credentials from Key Vault: {e}")
+        return None, None
+
+
+def logout(session):
+    """Log out of Qualys session."""
+    try:
+        session.post(
+            f"{BASE_URL}/api/2.0/fo/session/",
+            data={"action": "logout"},
+            verify=False,
+            timeout=30,
+        )
+        print("[+] Logged out.")
+    except Exception as e:
+        print(f"[!] Logout failed (non-fatal): {e}")
+
+
+def upload_kb_to_blob():
+    """Upload kb.csv to Azure Blob Storage."""
+    from azure.identity import ClientSecretCredential
+    from azure.storage.blob import BlobServiceClient
+
+    tenant_id       = os.getenv("AZURE_TENANT_ID")
+    client_id       = os.getenv("AZURE_CLIENT_ID")
+    client_secret   = os.getenv("AZURE_CLIENT_SECRET")
+    storage_account = os.getenv("AZURE_STORAGE_ACCOUNT")
+    container_name  = os.getenv("AZURE_CONTAINER_NAME")
+
+    if not all([tenant_id, client_id, client_secret, storage_account, container_name]):
+        print("[!] Azure credentials incomplete — skipping upload. Check .env.")
+        return
+
+    try:
+        credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        blob_service = BlobServiceClient(
+            account_url=f"https://{storage_account}.blob.core.windows.net",
+            credential=credential
+        )
+        container = blob_service.get_container_client(container_name)
+
+        with open(KB_PATH, "rb") as f:
+            container.upload_blob("kb.csv", f, overwrite=True)
+        print("[+] kb.csv uploaded to Azure Blob Storage.")
+
+    except Exception as e:
+        print(f"[!] Azure upload failed (non-fatal): {e}")
+        print("    Local kb.csv is intact.")
 
 
 def get_qids_from_detections():
@@ -58,8 +132,8 @@ def fetch_kb_batch(session, qids):
     resp = session.get(
         f"{BASE_URL}/api/2.0/fo/knowledge_base/vuln/",
         params={
-            "action": "list",
-            "ids":    ",".join(str(q) for q in qids),
+            "action":  "list",
+            "ids":     ",".join(str(q) for q in qids),
             "details": "All",
         },
         verify=False,
@@ -79,11 +153,13 @@ def fetch_kb_batch(session, qids):
     for vuln in root.findall(".//VULN"):
         qid = vuln.findtext("QID", "")
 
-        # CVE list — may contain multiple CVE_ID entries
-        cves = [c.text for c in vuln.findall(".//CVE_ID") if c.text]
+        # CVE list — nested under CVE_LIST/CVE/ID
+        cves = [c.text for c in vuln.findall(".//CVE_LIST/CVE/ID") if c.text]
         cve_str = "|".join(cves)
 
-        # CVSS scores — v2 and v3 live in different elements
+        # CVSS v2 — under CVSS/BASE
+        # CVSS v3 — under CVSS_V3/BASE
+        # Both may be absent for older QIDs
         cvss_base  = vuln.findtext(".//CVSS/BASE", "") or vuln.findtext("CVSS_BASE", "")
         cvss3_base = vuln.findtext(".//CVSS_V3/BASE", "") or vuln.findtext("CVSS3_BASE", "")
 
@@ -107,6 +183,12 @@ def fetch_kb_batch(session, qids):
 
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # ── Fetch credentials from Key Vault ──────────────────────────────────────
+    USERNAME, PASSWORD = get_qualys_credentials()
+    if not USERNAME or not PASSWORD:
+        print("[!] Could not retrieve credentials — aborting.")
+        return
 
     # ── Get QIDs ──────────────────────────────────────────────────────────────
     qids = get_qids_from_detections()
@@ -132,46 +214,58 @@ def main():
         return
     print("[+] Logged in.")
 
-    # ── Fetch in batches ──────────────────────────────────────────────────────
-    all_records = []
-    batches = [qids[i:i+BATCH_SIZE] for i in range(0, len(qids), BATCH_SIZE)]
-    print(f"[+] Fetching KnowledgeBase in {len(batches)} batches of up to {BATCH_SIZE}...")
+    try:
+        # ── Fetch in batches ──────────────────────────────────────────────────
+        all_records = []
+        batches = [qids[i:i+BATCH_SIZE] for i in range(0, len(qids), BATCH_SIZE)]
+        print(f"[+] Fetching KnowledgeBase in {len(batches)} batches of up to {BATCH_SIZE}...")
 
-    for i, batch in enumerate(batches, 1):
-        print(f"  [batch {i}/{len(batches)}] fetching {len(batch)} QIDs...")
-        records = fetch_kb_batch(session, batch)
-        all_records.extend(records)
-        print(f"  [batch {i}/{len(batches)}] got {len(records)} records")
+        for i, batch in enumerate(batches, 1):
+            print(f"  [batch {i}/{len(batches)}] fetching {len(batch)} QIDs...")
+            records = fetch_kb_batch(session, batch)
+            all_records.extend(records)
+            print(f"  [batch {i}/{len(batches)}] got {len(records)} records")
 
-    print(f"[+] Total KB records fetched: {len(all_records)}")
+        print(f"[+] Total KB records fetched: {len(all_records)}")
 
-    # ── Write kb.csv (overwrite — it's a lookup table) ────────────────────────
-    print(f"[+] Writing {KB_PATH}...")
-    fieldnames = [
-        "qid", "title", "category", "vuln_type",
-        "cvss_base", "cvss3_base", "pci_flag",
-        "published_date", "modified_date", "cve_list",
-    ]
-    with open(KB_PATH, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_records)
+        # ── Write kb.csv (overwrite — it's a lookup table) ────────────────────
+        print(f"[+] Writing {KB_PATH}...")
+        fieldnames = [
+            "qid", "title", "category", "vuln_type",
+            "cvss_base", "cvss3_base", "pci_flag",
+            "published_date", "modified_date", "cve_list",
+        ]
+        with open(KB_PATH, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_records)
 
-    print(f"[+] Done — {len(all_records)} QIDs written to {KB_PATH}")
+        print(f"[+] Done — {len(all_records)} QIDs written to {KB_PATH}")
 
-    # ── Sanity check ──────────────────────────────────────────────────────────
-    missing = len(qids) - len(all_records)
-    if missing > 0:
-        print(f"\n[!] {missing} QIDs not returned by KnowledgeBase.")
-        print("    These may be info-gathering checks (not true vulns) or retired QIDs.")
+        # ── Sanity check ──────────────────────────────────────────────────────
+        missing = len(qids) - len(all_records)
+        if missing > 0:
+            print(f"\n[!] {missing} QIDs not returned by KnowledgeBase.")
+            print("    These may be info-gathering checks or retired QIDs.")
 
-    # Sample output
-    print("\n    Sample records:")
-    for r in all_records[:5]:
-        print(f"      QID {r['qid']:>8}  CVSS3={r['cvss3_base'] or 'n/a':>4}  {r['title'][:60]}")
+        # Sample output
+        print("\n    Sample records:")
+        for r in all_records[:5]:
+            print(f"      QID {r['qid']:>8}  CVSS3={r['cvss3_base'] or 'n/a':>4}  {r['title'][:60]}")
+
+        # ── Upload to Azure Blob Storage ──────────────────────────────────────
+        print("[+] Uploading kb.csv to Azure Blob Storage...")
+        upload_kb_to_blob()
+
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+
+    finally:
+        logout(session)
 
 
 if __name__ == "__main__":
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     main()
+
