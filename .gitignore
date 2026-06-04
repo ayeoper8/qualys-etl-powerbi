@@ -3,3 +3,4 @@ output/
 logs/
 __pycache__/
 *.pyc
+script_run
