@@ -2,6 +2,20 @@
 
 Automated vulnerability reporting pipeline — pulls data from the Qualys API, transforms it into clean datasets, and feeds Power BI dashboards for management and security team reporting.
 
+## Dashboards
+
+### Executive Summary
+![Executive Summary](screenshots/exec.png)
+*Screenshots use anonymised mock data for portfolio purposes.*
+
+Management-facing overview of security posture across the full asset estate. Shows vulnerability trends by severity, open Critical and High counts with month-on-month comparison, median days open by asset group, and critical risk ranked by fleet.
+
+### Drill Down
+![Drill Down](screenshots/drill.png)
+*Screenshots use anonymised mock data for portfolio purposes.*
+
+Security team view. Asset group slicer filters all visuals simultaneously. Shows top 10 most vulnerable hosts, vulnerability age distribution, and top vulnerabilities ranked by Qualys Detection Score (QDS).
+
 ## Overview
 
 A daily ETL pipeline running on a Proxmox LXC container that:
@@ -21,6 +35,7 @@ A daily ETL pipeline running on a Proxmox LXC container that:
         ↓
 [qualys_etl.py — daily cron @ 06:00]
 [qualys_kb.py  — weekly cron @ 07:00 Sunday]
+[qualys_scan_health.py — weekly cron @ 07:00 Monday]
         ↓
 [Azure Key Vault — credentials fetched at runtime]
         ↓
@@ -28,7 +43,7 @@ A daily ETL pipeline running on a Proxmox LXC container that:
         ↓
 [Azure Blob Storage — vulnerability-data container]
         ↓
-[Power BI Desktop → Power BI Service]
+[Power BI Service — auto-refreshes daily at 07:00]
 ```
 
 ## Asset Classification
@@ -53,25 +68,35 @@ Vessel classification runs first and takes priority over OS-based checks.
 | `summary.csv` | Aggregated by asset group + severity per day | 3 years |
 | `kb.csv` | QID lookup — titles, CVSS, CVE IDs | Overwrite weekly |
 
-## Dashboards
+## Dashboard Pages
 
-- **Executive Summary** — management-facing, trend lines, severity profile, critical risk by asset group
-- **Drill Down** — security team view, top vulnerable hosts, vulnerability age, top QIDs by risk score
+- **Executive Summary** — management-facing, trend lines by severity, month-on-month KPI cards, median days open by asset group, critical risk ranked by fleet
+- **Drill Down** — security team view, asset group slicer, top vulnerable hosts, vulnerability age distribution, top QIDs by QDS risk score
 - **Shipsure** — dedicated view for client-facing production infrastructure
-- **Host Detail** — per-host vulnerability drillthrough (requires Power BI Pro)
+- **Host Detail** — per-host vulnerability drillthrough (Power BI Pro)
+
+## Scripts
+
+| Script | Purpose | Schedule |
+|---|---|---|
+| `qualys_etl.py` | Main ETL — pulls all VM detection data | Daily 06:00 |
+| `qualys_kb.py` | KnowledgeBase enrichment — titles, CVSS, CVEs | Weekly Sunday 07:00 |
+| `qualys_scan_health.py` | Auth scan health check — Teams webhook alert | Weekly Monday 07:00 |
 
 ## Project Structure
 
 ```
 /app/qualys/
 ├── src/
-│   ├── qualys_etl.py       # Main ETL — daily
-│   └── qualys_kb.py        # KnowledgeBase enrichment — weekly
-├── output/                 # Generated CSVs (not versioned)
-├── logs/                   # Daily logs, 30-day retention
-├── .env                    # Azure identity only (not versioned)
-├── run_etl.sh              # Daily cron wrapper
-└── run_kb.sh               # Weekly cron wrapper
+│   ├── qualys_etl.py           # Main ETL
+│   ├── qualys_kb.py            # KnowledgeBase enrichment
+│   └── qualys_scan_health.py   # Scan health monitor
+├── output/                     # Generated CSVs (not versioned)
+├── logs/                       # Daily logs, 30-day retention
+├── .env                        # Azure identity only (not versioned)
+├── run_etl.sh                  # Daily cron wrapper
+├── run_kb.sh                   # Weekly cron wrapper
+└── run_scan_health.sh          # Weekly cron wrapper
 ```
 
 ## Setup
@@ -83,6 +108,7 @@ Vessel classification runs first and takes priority over OS-based checks.
 - Azure Storage Account with Blob container
 - Azure Key Vault with Qualys credentials stored as secrets
 - Azure App Registration with Storage Blob Data Contributor and Key Vault Secrets User roles
+- Power BI Pro licence for dashboard publishing and sharing
 
 ### Installation
 
@@ -105,6 +131,7 @@ export AZURE_CLIENT_SECRET='your_client_secret'
 export AZURE_STORAGE_ACCOUNT=your_storage_account_name
 export AZURE_CONTAINER_NAME=vulnerability-data
 export AZURE_KEYVAULT_URL=https://your-keyvault-name.vault.azure.net
+export TEAMS_WEBHOOK_URL=your_teams_webhook_url
 ```
 
 ```bash
@@ -124,6 +151,7 @@ chown qualys:qualys /app/qualys/.env
 ```bash
 0 6 * * * /app/qualys/run_etl.sh
 0 7 * * 0 /app/qualys/run_kb.sh
+0 7 * * 1 /app/qualys/run_scan_health.sh
 ```
 
 ### Manual Run
@@ -150,12 +178,10 @@ su -s /bin/bash qualys -c "source /app/qualys/.env && python3 /app/qualys/src/qu
 | KnowledgeBase enrichment | ✅ Complete |
 | Azure Key Vault + Blob Storage | ✅ Complete |
 | Cron automation | ✅ Complete |
+| Scan health monitoring | ✅ Complete |
 | Power BI dashboards | ✅ Complete |
-| Power BI Service publishing | ⏳ Pending Pro licence |
+| Power BI Service publishing | ✅ Complete |
 
 ## Known improvements
-- Host detail drillthrough — pending Power BI Pro licence
-- Azure Arc + Managed Identity — eliminate client secret from `.env`
 - SSL verification — test `verify=True` once corporate proxy confirmed
 - Extend Qualys authenticated scanning to Linux and network devices
-- Teams webhook for ETL failure alerting
