@@ -50,7 +50,7 @@ A daily ETL pipeline running on a Proxmox LXC container that:
 
 | Group | Classification logic |
 |---|---|
-| Vessel | NETBIOS hostname contains vessel keywords (MASTER, BRIDGE, CHENG, CHIEFENG, VSG1, VSG2, etc.) |
+| Vessel | NETBIOS hostname contains vessel keywords (MASTER, BRIDGE, CHENG, CHIEFENG, etc.) |
 | Hypervisor | OS string contains VMware ESXi, Hyper-V |
 | Network | OS string contains Cisco, Fortinet, Juniper, etc. |
 | Server | OS string contains Server, Linux, Ubuntu, Windows 20xx, etc. |
@@ -72,7 +72,6 @@ Vessel classification runs first and takes priority over OS-based checks.
 
 - **Executive Summary** — management-facing, trend lines by severity, month-on-month KPI cards, median days open by asset group, critical risk ranked by fleet
 - **Drill Down** — security team view, asset group slicer, top vulnerable hosts, vulnerability age distribution, top QIDs by QDS risk score
-- **Shipsure** — dedicated view for client-facing production infrastructure
 - **Host Detail** — per-host vulnerability drillthrough (Power BI Pro)
 
 ## Scripts
@@ -125,6 +124,7 @@ chown -R qualys:qualys /app/qualys
 Create `/app/qualys/.env`:
 
 ```bash
+export QUALYS_BASE_URL=qualys_api_url
 export AZURE_TENANT_ID=your_tenant_id
 export AZURE_CLIENT_ID=your_client_id
 export AZURE_CLIENT_SECRET='your_client_secret'
