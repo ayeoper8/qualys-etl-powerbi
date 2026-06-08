@@ -25,7 +25,7 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BASE_URL   = "https://qualysapi.qg1.apps.qualys.co.uk"
+BASE_URL   = os.getenv("QUALYS_BASE_URL")
 OUTPUT_DIR = Path("/app/qualys/output")
 KB_PATH    = OUTPUT_DIR / "kb.csv"
 DET_PATH   = OUTPUT_DIR / "detections.csv"
