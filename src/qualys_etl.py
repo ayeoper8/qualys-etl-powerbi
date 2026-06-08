@@ -42,8 +42,7 @@ VESSEL_KEYWORDS = [
     # Vessel infrastructure
     "VSHOST", "VSG1", "VSG2", "VESSEL", "GENERAL",
     # Navigation & office
-    "BKUPNAV", "NAVBKUP", "SHIPOFFICE", "SSSERVER", "OCEANSERVER",
-    "CHARTCO", "CHARTCOBAC", "CHART", "ONEOCEAN",
+    "BKUPNAV", "NAVBKUP", "SHIPOFFICE"
 ]
 
 HYPERVISOR_OS_KEYWORDS = [
