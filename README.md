@@ -181,7 +181,3 @@ su -s /bin/bash qualys -c "source /app/qualys/.env && python3 /app/qualys/src/qu
 | Scan health monitoring | ✅ Complete |
 | Power BI dashboards | ✅ Complete |
 | Power BI Service publishing | ✅ Complete |
-
-## Known improvements
-- SSL verification — test `verify=True` once corporate proxy confirmed
-- Extend Qualys authenticated scanning to Linux and network devices
